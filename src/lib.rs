@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
+use std::panic::{self, PanicHookInfo};
 
 extern crate serde_json;
 
@@ -13,14 +14,29 @@ const API_ENDPOINT: &str = "https://us.i.posthog.com/capture/";
 const TIMEOUT: &Duration = &Duration::from_millis(800); // This should be specified by the user
 
 pub fn client<C: Into<ClientOptions>>(options: C) -> Client {
-    let client = HttpClient::builder()
+    let http_client = HttpClient::builder()
         .timeout(Some(*TIMEOUT))
         .build()
         .unwrap(); // Unwrap here is as safe as `HttpClient::new`
-    Client {
+    let client = Client {
         options: options.into(),
-        client,
+        client: http_client,
+    };
+
+    if client.options.enable_panic_capturing {
+        let panic_reporter_client = client.clone();
+        let next = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            let mut exception = exception_from_panic_info(info, &panic_reporter_client.options.default_distinct_id);
+            if panic_reporter_client.options.on_panic_exception.is_some() {
+                panic_reporter_client.options.on_panic_exception.unwrap()(&mut exception)
+            }
+            let _  = panic_reporter_client.capture_exception(exception);
+            next(info);
+        }));
     }
+
+    client
 }
 
 impl Display for Error {
@@ -28,6 +44,7 @@ impl Display for Error {
         match self {
             Error::Connection(msg) => write!(f, "Connection Error: {}", msg),
             Error::Serialization(msg) => write!(f, "Serialization Error: {}", msg),
+            Error::Panic(msg) => write!(f, "Panic: {}", msg),
         }
     }
 }
@@ -38,11 +55,16 @@ impl std::error::Error for Error {}
 pub enum Error {
     Connection(String),
     Serialization(String),
+    Panic(String),
 }
 
+#[derive(Clone)]
 pub struct ClientOptions {
     api_endpoint: String,
     api_key: String,
+    default_distinct_id: String,
+    enable_panic_capturing: bool,
+    on_panic_exception: Option<fn(&mut Exception)>,
 }
 
 impl From<&str> for ClientOptions {
@@ -50,10 +72,26 @@ impl From<&str> for ClientOptions {
         ClientOptions {
             api_endpoint: API_ENDPOINT.to_string(),
             api_key: api_key.to_string(),
+            default_distinct_id: uuid::Uuid::new_v4().to_string(),
+            enable_panic_capturing: true,
+            on_panic_exception: None,
         }
     }
 }
 
+impl ClientOptions {
+    pub fn new(api_key: &str, default_distinct_id: Option<&str>, enable_panic_capturing: bool, on_panic_exception: Option<fn(&mut Exception)>) -> Self {
+        Self {
+            api_endpoint: API_ENDPOINT.to_string(),
+            api_key: api_key.to_string(),
+            default_distinct_id: default_distinct_id.unwrap_or(&uuid::Uuid::new_v4().to_string()).to_string(),
+            enable_panic_capturing,
+            on_panic_exception,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Client {
     options: ClientOptions,
     client: HttpClient,
@@ -75,6 +113,18 @@ impl Client {
     pub fn capture_batch(&self, events: Vec<Event>) -> Result<(), Error> {
         for event in events {
             self.capture(event)?;
+        }
+        Ok(())
+    }
+
+    pub fn capture_exception(&self, exception: Exception) -> Result<(), Error> {
+        let event = exception.to_event();
+        self.capture(event)
+    }
+
+    pub fn capture_exception_batch(&self, exceptions: Vec<Exception>) -> Result<(), Error> {
+        for exception in exceptions {
+            self.capture_exception(exception)?;
         }
         Ok(())
     }
@@ -129,6 +179,14 @@ impl InnerEvent {
     }
 }
 
+pub trait EventBase {
+    fn insert_prop<K: Into<String>, P: Serialize>(
+        &mut self,
+        key: K,
+        prop: P,
+    ) -> Result<(), Error>;
+}
+
 #[derive(Serialize, Debug, PartialEq, Eq)]
 pub struct Event {
     event: String,
@@ -136,17 +194,43 @@ pub struct Event {
     timestamp: Option<NaiveDateTime>,
 }
 
-#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct Exception {
+    properties: Properties,
+    timestamp: Option<NaiveDateTime>,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq, Clone)]
 pub struct Properties {
     distinct_id: String,
     props: HashMap<String, serde_json::Value>,
+    #[serde(rename = "$lib")]
+    lib: String,
+    #[serde(rename = "$lib_version")]
+    lib_version: String,
+    #[serde(rename = "$os")]
+    os: String,
+    #[serde(rename = "$os_version")]
+    os_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "$exception_level")]
+    exception_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "$exception_list")]
+    exception_list: Option<serde_json::Value>,
 }
 
 impl Properties {
     fn new<S: Into<String>>(distinct_id: S) -> Self {
+        let os_info = os_info::get();
         Self {
             distinct_id: distinct_id.into(),
             props: Default::default(),
+            lib: "posthog-rs".to_string(),
+            lib_version: env!("CARGO_PKG_VERSION").to_string(),
+            os: os_info.os_type().to_string(),
+            os_version: os_info.version().to_string(),
+            exception_level: None,
+            exception_list: None,
         }
     }
 }
@@ -159,9 +243,11 @@ impl Event {
             timestamp: None,
         }
     }
+}
 
+impl EventBase for Event {
     /// Errors if `prop` fails to serialize
-    pub fn insert_prop<K: Into<String>, P: Serialize>(
+    fn insert_prop<K: Into<String>, P: Serialize>(
         &mut self,
         key: K,
         prop: P,
@@ -170,6 +256,96 @@ impl Event {
             serde_json::to_value(prop).map_err(|e| Error::Serialization(e.to_string()))?;
         let _ = self.properties.props.insert(key.into(), as_json);
         Ok(())
+    }
+}
+
+impl Exception {
+    pub fn new<S: Into<String>>(exception: &dyn std::error::Error, distinct_id: S) -> Self {
+        Self {
+            properties: Properties::new(distinct_id),
+            timestamp: None,
+        }
+            .with_exception_level(Some("error".to_string()))
+            .set_exception_list(exception)
+    }
+
+    pub fn with_exception_level(mut self, exception_level: Option<String>) -> Self {
+        self.properties.exception_level = exception_level;
+        self
+    }
+    
+    fn set_exception_list(mut self, exception: &dyn std::error::Error) -> Self {
+        let mut exception_info = serde_json::Map::new();
+        exception_info.insert("type".into(), serde_json::Value::String(Exception::parse_exception_type(exception)));
+        exception_info.insert("value".into(), serde_json::Value::String(exception.to_string()));
+        let mut mechanism = serde_json::Map::new();
+        mechanism.insert("handled".into(), serde_json::Value::Bool(true));
+        mechanism.insert("synthetic".into(), serde_json::Value::Bool(false));
+        exception_info.insert("mechanism".into(), serde_json::Value::Object(mechanism));
+
+        //TODO: Parse and add stacktrace
+
+        self.properties.exception_list = Some(serde_json::Value::Array(vec![serde_json::Value::Object(exception_info)]));
+        self
+    }
+
+    fn parse_exception_type(exception: &dyn std::error::Error) -> String {
+        let dbg = format!("{exception:?}");
+        let value = exception.to_string();
+    
+        // A generic `anyhow::msg` will just `Debug::fmt` the `String` that you feed
+        // it. Trying to parse the type name from that will result in a leading quote
+        // and the first word, so quite useless.
+        // To work around this, we check if the `Debug::fmt` of the complete error
+        // matches its `Display::fmt`, in which case there is no type to parse and
+        // we will just be using `Error`.
+        let exception_type = if dbg == format!("{value:?}") {
+            String::from("Error")
+        } else {
+            dbg.split(&[' ', '(', '{', '\r', '\n'][..])
+                .next()
+                .unwrap()
+                .trim()
+                .to_owned()
+        };
+        exception_type
+    }
+
+    pub fn to_event(&self) -> Event {
+        let mut event = Event::new("$exception", &self.properties.distinct_id);
+        event.timestamp = self.timestamp;
+        event.properties = self.properties.clone();
+        event
+    }
+}
+
+impl EventBase for Exception {
+    /// Errors if `prop` fails to serialize
+    fn insert_prop<K: Into<String>, P: Serialize>(
+        &mut self,
+        key: K,
+        prop: P,
+    ) -> Result<(), Error> {
+        let as_json =
+            serde_json::to_value(prop).map_err(|e| Error::Serialization(e.to_string()))?;
+        let _ = self.properties.props.insert(key.into(), as_json);
+        Ok(())
+    }
+}
+
+fn exception_from_panic_info(info: &PanicHookInfo<'_>, distinct_id: &String) -> Exception {
+    let msg = message_from_panic_info(info);
+    let error = Error::Panic(msg.into());
+    Exception::new(&error, distinct_id)
+}
+
+pub fn message_from_panic_info<'a>(info: &'a PanicHookInfo<'_>) -> &'a str {
+    match info.payload().downcast_ref::<&'static str>() {
+        Some(s) => s,
+        None => match info.payload().downcast_ref::<String>() {
+            Some(s) => &s[..],
+            None => "Box<Any>",
+        },
     }
 }
 
