@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
 use std::panic::{self, PanicHookInfo};
+use std::sync::Arc;
 
 extern crate serde_json;
 
@@ -29,7 +30,7 @@ pub fn client<C: Into<ClientOptions>>(options: C) -> Client {
         panic::set_hook(Box::new(move |info| {
             let mut exception = exception_from_panic_info(info, &panic_reporter_client.options.default_distinct_id);
             if panic_reporter_client.options.on_panic_exception.is_some() {
-                panic_reporter_client.options.on_panic_exception.unwrap()(&mut exception)
+                panic_reporter_client.options.on_panic_exception.as_ref().unwrap()(&mut exception)
             }
             let _  = panic_reporter_client.capture_exception(exception);
             next(info);
@@ -64,7 +65,7 @@ pub struct ClientOptions {
     api_key: String,
     default_distinct_id: String,
     enable_panic_capturing: bool,
-    on_panic_exception: Option<fn(&mut Exception)>,
+    on_panic_exception: Option<Arc<dyn Fn(&mut Exception) + Send + Sync>>,
 }
 
 impl From<&str> for ClientOptions {
@@ -80,13 +81,15 @@ impl From<&str> for ClientOptions {
 }
 
 impl ClientOptions {
-    pub fn new(api_key: &str, default_distinct_id: Option<&str>, enable_panic_capturing: bool, on_panic_exception: Option<fn(&mut Exception)>) -> Self {
+    pub fn new<F>(api_key: &str, default_distinct_id: Option<&str>, enable_panic_capturing: bool, on_panic_exception: Option<F>) -> Self
+    where F: Fn(&mut Exception) + Send + Sync + 'static
+    {
         Self {
             api_endpoint: API_ENDPOINT.to_string(),
             api_key: api_key.to_string(),
             default_distinct_id: default_distinct_id.unwrap_or(&uuid::Uuid::new_v4().to_string()).to_string(),
             enable_panic_capturing,
-            on_panic_exception,
+            on_panic_exception: on_panic_exception.map(|cb| Arc::new(cb) as Arc<dyn Fn(&mut Exception) + Send + Sync>),
         }
     }
 }
