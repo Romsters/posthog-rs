@@ -1,11 +1,13 @@
 use std::time::Duration;
+use std::panic;
 
 use reqwest::{header::CONTENT_TYPE, Client as HttpClient};
 
-use crate::{event::InnerEvent, Error, Event};
+use crate::{event::InnerEvent, Error, Event, Exception};
 
-use super::ClientOptions;
+use super::{ClientOptions, exception_from_panic_info};
 
+#[derive(Clone)]
 pub struct Client {
     options: ClientOptions,
     client: HttpClient,
@@ -13,11 +15,26 @@ pub struct Client {
 
 pub async fn client<C: Into<ClientOptions>>(options: C) -> Client {
     let options = options.into();
-    let client = HttpClient::builder()
+    let http_client = HttpClient::builder()
         .timeout(Duration::from_secs(options.request_timeout_seconds))
         .build()
         .unwrap(); // Unwrap here is as safe as `HttpClient::new`
-    Client { options, client }
+    let client = Client { options, client: http_client };
+
+    if client.options.enable_panic_capturing {
+        let panic_reporter_client = client.clone();
+        let next = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            let mut exception = exception_from_panic_info(info, &panic_reporter_client.options.default_distinct_id);
+            if panic_reporter_client.options.on_panic_exception.is_some() {
+                panic_reporter_client.options.on_panic_exception.as_ref().unwrap()(&mut exception)
+            }
+            let _  = panic_reporter_client.capture_exception(exception);
+            next(info);
+        }));
+    }
+
+    client
 }
 
 impl Client {
@@ -56,5 +73,18 @@ impl Client {
             .map_err(|e| Error::Connection(e.to_string()))?;
 
         Ok(())
+    }
+
+    pub async fn capture_exception(&self, exception: Exception) -> Result<(), Error> {
+        let event = exception.to_event();
+        self.capture(event).await
+    }
+
+    pub async fn capture_exception_batch(&self, exceptions: Vec<Exception>) -> Result<(), Error> {
+        let events: Vec<_> = exceptions
+            .into_iter()
+            .map(|exception| exception.to_event())
+            .collect();
+        self.capture_batch(events).await
     }
 }
